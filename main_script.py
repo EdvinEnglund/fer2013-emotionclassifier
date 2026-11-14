@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset
-from torchvision import datasets, transforms
-import matplotlib.pyplot as plt
+from torchvision import transforms
 import pandas as pd
 import numpy as np
+import copy
 
 ###CREATE PYTORCH DATASET CLASS###
 
@@ -87,7 +87,7 @@ class EmotionCNN(nn.Module):
         x = self.fc_layers(x)
         return x
 
-device = torch.device("cpu")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = EmotionCNN().to(device)
 
 ###DEFINE LOSS AND OPTIMISER###
@@ -109,15 +109,88 @@ for epoch in range(num_epochs):
         running_loss += loss.item()
     print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {running_loss / len(train_loader):.4f}")
 
-###EVALUATE MODEL PERFORMANCE###
-model.eval()
-correct = 0
-total = 0
-with torch.no_grad():
-    for images, labels in test_loader:
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        _, predicted = torch.max(outputs.data, 1)
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
-print(f"Test Accuracy: {100 * correct / total:.2f}%")
+###EVALUATE MODEL PERFORMANCE ACROSS SIMULATED QUANTIZATION SETTINGS###
+
+# Evaluate any version of the trained model
+def evaluate(model, loader):
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.inference_mode():
+        for images, labels in loader:
+            outputs = model(images.to("cpu"))
+            predictions = outputs.argmax(dim=1)
+
+            correct += (predictions == labels).sum().item()
+            total += labels.size(0)
+
+    return 100 * correct / total
+
+
+# Simulate symmetric weight quantization
+def quantize_weights(model, bits, per_channel=False):
+    quant_model = copy.deepcopy(model).cpu().eval()
+
+    qmax = 2 ** (bits - 1) - 1
+
+    with torch.no_grad():
+        for layer in quant_model.modules():
+            if isinstance(layer, (nn.Conv2d, nn.Linear)):
+                weights = layer.weight
+
+                if per_channel:
+                    # Separate scale for each output channel
+                    dims = tuple(range(1, weights.ndim))
+                    max_abs = weights.abs().amax(
+                        dim=dims, keepdim=True
+                    )
+                else:
+                    # One scale for the entire weight tensor
+                    max_abs = weights.abs().max()
+
+                scale = (max_abs / qmax).clamp(min=1e-12)
+
+                quantized = torch.round(weights / scale)
+                quantized = torch.clamp(
+                    quantized, -qmax, qmax
+                )
+
+                # Dequantize back to floating point
+                weights.copy_(quantized * scale)
+
+    return quant_model
+
+
+# Run experiments
+results = []
+
+baseline = evaluate(model.cpu(), test_loader)
+
+results.append({
+    "Bits": 32,
+    "Granularity": "FP32 baseline",
+    "Accuracy": baseline
+})
+
+for bits in [8, 6, 4, 2]:
+    for granularity in ["per_tensor", "per_channel"]:
+
+        quant_model = quantize_weights(
+            model,
+            bits=bits,
+            per_channel=(granularity == "per_channel")
+        )
+
+        accuracy = evaluate(quant_model, test_loader)
+
+        results.append({
+            "Bits": bits,
+            "Granularity": granularity,
+            "Accuracy": accuracy
+        })
+
+df = pd.DataFrame(results)
+df["Accuracy drop (pp)"] = baseline - df["Accuracy"]
+
+print(df.to_string(index=False))
